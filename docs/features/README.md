@@ -437,9 +437,17 @@ in [transcription_models.rs](../../src/transcription_models.rs). The check is
 `removing_a_model_deletes_its_artifacts_unless_a_download_is_active` (real files
 and lock); no Rune test covers the picker's two-step confirmation yet.
 
-**Known gap:** `is_installed` checks size, not checksum. Not every native-load
-path requires verification. Picker Active means selected/installed, not live
-worker readiness; a later worker-load failure does not roll back saved selection.
+A worker load proves the artifact's pinned checksum through `ensure_verified`:
+a matching receipt costs one stat, a missing or stale one hashes the file once
+and records the result, and a mismatch fails the load with "Download it again
+to repair it." instead of letting the native loader reject the file. Checks:
+`the_first_load_hashes_an_unreceipted_model_and_records_it`,
+`a_model_that_fails_its_checksum_is_refused_before_load`, and
+`a_model_changed_after_verification_is_hashed_again` (real files).
+
+**Known gap:** `is_installed` checks the pinned size only, so Picker Active
+means selected and installed at that size, not live worker readiness; a later
+worker-load failure does not roll back saved selection.
 
 ## Dictate
 

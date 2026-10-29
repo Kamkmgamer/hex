@@ -146,6 +146,10 @@ impl LocalTranscriber {
                 definition.name
             ));
         }
+        // The pinned checksum, not just the byte size, decides what a worker
+        // loads, so a corrupt file fails here with a repair message instead
+        // of inside the native loader.
+        crate::transcription_models::ensure_verified(definition, &AtomicBool::new(false))?;
         let path = model_path(definition)?;
         let model = Model::load_with(
             &path,

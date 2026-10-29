@@ -772,6 +772,55 @@ pub fn is_verified(model: &ModelDefinition) -> bool {
     verification_receipt_matches(&path, model)
 }
 
+/// Proves an installed artifact is the pinned one before a worker loads it.
+///
+/// A matching receipt costs one stat and a small read. Without one, the
+/// artifact is hashed once and the receipt recorded for later loads, so a
+/// model downloaded by an older release or copied into place is verified
+/// rather than rejected. A mismatch fails the load with a repair message
+/// instead of letting the native loader reject the file.
+///
+/// This skips `verify_installed`'s download lock on purpose: downloads write a
+/// partial file and promote it with a rename, so the visible artifact is
+/// always complete, and a listener that loads a new selection beside another
+/// model's download must not wait for that download to finish.
+pub fn ensure_verified(model: &ModelDefinition, canceled: &AtomicBool) -> Result<()> {
+    // Apple Speech assets are managed and verified by macOS; `is_installed`
+    // reports their readiness.
+    if !matches!(model.runtime, ModelRuntime::Gguf(_)) {
+        return Ok(());
+    }
+    ensure_verified_at(&model_path(model)?, model, canceled)
+}
+
+fn ensure_verified_at(path: &Path, model: &ModelDefinition, canceled: &AtomicBool) -> Result<()> {
+    check_canceled(canceled)?;
+    if !path.is_file() {
+        bail!(
+            "{} is no longer installed. Open Settings to download it.",
+            model.name
+        );
+    }
+    if verification_receipt_matches(path, model) {
+        return Ok(());
+    }
+    let ModelRuntime::Gguf(artifact) = model.runtime else {
+        bail!("{} has no artifact to verify", model.name);
+    };
+    // Record the modification time read before hashing. If the file is
+    // replaced mid-check, the newer time invalidates the receipt instead of
+    // pairing one file's bytes with another file's timestamp.
+    let modified = modified_ns(&fs::metadata(path)?)
+        .ok_or_else(|| eyre!("{} has no modification time", path.display()))?;
+    verify_artifact(path, artifact, model.name, canceled).wrap_err_with(|| {
+        format!(
+            "{} failed its checksum. Download it again to repair it.",
+            model.name
+        )
+    })?;
+    write_artifact_receipt_at(path, artifact, modified)
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 pub fn verify_installed(model: &ModelDefinition, canceled: &AtomicBool) -> Result<PathBuf> {
     check_canceled(canceled)?;
@@ -908,7 +957,6 @@ fn lock_downloads(directory: &Path, canceled: &AtomicBool) -> Result<File> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn verification_receipt_matches(path: &Path, model: &ModelDefinition) -> bool {
     let ModelRuntime::Gguf(artifact) = model.runtime else {
         return false;
@@ -1241,11 +1289,19 @@ fn write_verification_receipt(path: &Path, model: &ModelDefinition) -> Result<()
 
 fn write_artifact_receipt(path: &Path, artifact: &GgufArtifact) -> Result<()> {
     let metadata = fs::metadata(path)?;
+    let modified = modified_ns(&metadata)
+        .ok_or_else(|| color_eyre::eyre::eyre!("model modification time is unavailable"))?;
+    write_artifact_receipt_at(path, artifact, modified)
+}
+
+/// Writes the receipt for `artifact` with the modification time the caller
+/// hashed, so a file replaced mid-check cannot be paired with a receipt for
+/// bytes it no longer holds.
+fn write_artifact_receipt_at(path: &Path, artifact: &GgufArtifact, modified_ns: u64) -> Result<()> {
     let receipt = VerificationReceipt {
         bytes: artifact.bytes,
         sha256: artifact.sha256.into(),
-        modified_ns: modified_ns(&metadata)
-            .ok_or_else(|| color_eyre::eyre::eyre!("model modification time is unavailable"))?,
+        modified_ns,
     };
     write_json_atomically(&verification_receipt_path(path), &receipt)
 }
@@ -1772,6 +1828,83 @@ mod tests {
         assert!(verify_file(&path, &model).is_ok());
         fs::write(&path, b"world").unwrap();
         assert!(verify_file(&path, &model).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn apple_speech_has_no_artifact_to_verify() {
+        // macOS manages and verifies its own assets; `is_installed` answers
+        // readiness, so a load must not look for a GGUF path.
+        let apple_speech = definition(TranscriptionModelId::AppleSpeech);
+        assert!(ensure_verified(apple_speech, &AtomicBool::new(false)).is_ok());
+    }
+
+    #[test]
+    fn the_first_load_hashes_an_unreceipted_model_and_records_it() {
+        let model = fixture_model();
+        let path = std::env::temp_dir().join(format!(
+            "hex-model-first-load-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"hello").unwrap();
+        assert!(!verification_receipt_matches(&path, &model));
+
+        let canceled = AtomicBool::new(false);
+        ensure_verified_at(&path, &model, &canceled).unwrap();
+        assert!(verification_receipt_matches(&path, &model));
+        // The recorded receipt makes the next load a stat and a read.
+        ensure_verified_at(&path, &model, &canceled).unwrap();
+
+        let _ = fs::remove_file(verification_receipt_path(&path));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_model_that_fails_its_checksum_is_refused_before_load() {
+        let model = fixture_model();
+        let path = std::env::temp_dir().join(format!(
+            "hex-model-corrupt-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        // The right size, the wrong bytes: exactly what a size check admits.
+        fs::write(&path, b"world").unwrap();
+        let error = ensure_verified_at(&path, &model, &AtomicBool::new(false)).unwrap_err();
+        assert!(error.to_string().contains("failed its checksum"), "{error}");
+        assert!(!verification_receipt_matches(&path, &model));
+
+        let missing = std::env::temp_dir().join(format!(
+            "hex-model-missing-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let error = ensure_verified_at(&missing, &model, &AtomicBool::new(false)).unwrap_err();
+        assert!(
+            error.to_string().contains("is no longer installed"),
+            "{error}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_model_changed_after_verification_is_hashed_again() {
+        let model = fixture_model();
+        let path = std::env::temp_dir().join(format!(
+            "hex-model-changed-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"hello").unwrap();
+        let canceled = AtomicBool::new(false);
+        ensure_verified_at(&path, &model, &canceled).unwrap();
+
+        thread::sleep(Duration::from_millis(2));
+        fs::write(&path, b"world").unwrap();
+        assert!(ensure_verified_at(&path, &model, &canceled).is_err());
+
+        let _ = fs::remove_file(verification_receipt_path(&path));
         let _ = fs::remove_file(path);
     }
 

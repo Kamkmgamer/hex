@@ -1205,6 +1205,10 @@ impl Parakeet {
         if !crate::transcription_models::is_installed(definition, &selection.language) {
             return Err(eyre!("{} is not installed", definition.name));
         }
+        // A worker loads only an artifact whose bytes match the pinned
+        // checksum; a corrupt file fails here with a repair message instead
+        // of inside the native loader.
+        crate::transcription_models::ensure_verified(definition, &AtomicBool::new(false))?;
         let path = model_path(definition)?;
         let mut parakeet = Self::load_from(&path, true, Some(selection))?;
         parakeet.prewarm()?;
